@@ -32,11 +32,13 @@
 #include <avr/io.h>
 #include <util/twi.h>
 
+;register assignments
 LINE	= 24
 PARAM	= 24
 PWM	= 25
 I2C_OFF	= 26	; XL
 
+;
 .equiv I2C_WAI	, 0xf0
 .equiv I2C_VER	, 0xf1
 .equiv I2C_KEYS	, 0xf2
@@ -58,11 +60,14 @@ I2C_OFF	= 26	; XL
 .equiv SCL	, PC5
 .equiv LED_OE_N	, PC7
 
+;send clock pulse to led chip
 .macro CLOCK_OUT
 	SBI	_SFR_IO_ADDR(PORTC), LED_CLKR
 	CBI	_SFR_IO_ADDR(PORTC), LED_CLKR
 .endm
 
+;led data in = (pwm < reg)
+;pulse clock
 .macro COL_OUT reg
 	CP	PWM, \reg
 	BRSH	lclear\reg
@@ -89,13 +94,19 @@ ldone\reg:
 .func draw_loop
 draw_loop:
 Lframe_loop:
+	;reset frame interrupt
 	CBI	_SFR_IO_ADDR(PORTC), FRAME_INT
+	;y = &pixels[0]
 	LDI	YL, lo8(pixels)
 	LDI	YH, hi8(pixels)
+	;mask for enabling only column 8
 	LDI	LINE, 0xFE
 Lline_loop:
+	;output column mask
 	OUT	_SFR_IO_ADDR(PORTD), LINE
+	;reset pwm counter
 	LDI	PWM, 0
+	;load 24 registers with 24 sequential bytes (one column) from pixels array
 	LD	r0, Y+
 	LD	r1, Y+
 	LD	r2, Y+
@@ -120,6 +131,7 @@ Lline_loop:
 	LD	r21, Y+
 	LD	r22, Y+
 	LD	r23, Y+
+	;loop 64 times enabling the r g and b channels of each pixel for 0-50% of iterations based on the value for that color/pixel
 Lpwm_loop:
 	COL_OUT	r0
 	COL_OUT	r1
@@ -147,35 +159,55 @@ Lpwm_loop:
 	COL_OUT	r22
 	COL_OUT	r23
 	CBI	_SFR_IO_ADDR(PORTC), LED_LE
+	;if(++pwm<64)goto Lpwm_loop
 	INC	PWM
 	SBRS	PWM, 6
 	RJMP	Lpwm_loop
+	;rotate the mask left to move the zero to the next position (implicitly assumes the state of the carry flag will be 0
+	;so the invariant of only 1 zero bit is maintained after INC LINE) this is fine however, because cf is last modified
+	;by the compare instruction for the last col_out, and because the LEDs are only ever on at 50% duty cycle the last
+	;compare will have cleared the carry flag
 	ROL	LINE
+	;if we just shifted the 0 out into the carry flag we have done all 8 columns
 	BRCC	lframeend
+	;increment LINE to set it LSB to a 1 since we just shifted in a 0
 	INC	LINE
 	RJMP	Lline_loop
 lframeend:
+	;set frame_int pin to indicate that frame has just finished
 	SBI	_SFR_IO_ADDR(PORTB), FRAME_INT
+	;unsure why this is done
 	CBI	_SFR_IO_ADDR(PORTD), 7		; Clear PORTD
 
+	;pull output enable (active low) high to disable output
 	SBI	_SFR_IO_ADDR(PORTB), LED_OE_N	; Scan
+	;set pullups for bits 7-3
 	LDI	PARAM, 0xF8
 	OUT	_SFR_IO_ADDR(PORTD), PARAM
+	;set bits 7-3 to input
 	COM	PARAM
 	OUT	_SFR_IO_ADDR(DDRD), PARAM
+	;load old state of keys into temp register
 	LDS	PWM, keys
+	;read new state of keys
 	IN	PARAM, _SFR_IO_ADDR(PIND)
+	;flip ones to zeros and shift from 5msb to 5lsb
 	COM	PARAM
 	LSR	PARAM
 	LSR	PARAM
 	LSR	PARAM
+	;update keys with new state
 	STS	keys, PARAM
+	;if keys state did not change skip setting keys_int otherwise do set it
 	CPSE	PARAM, PWM
 	SBI     _SFR_IO_ADDR(PORTB), KEYS_INT
+	;set port d back to outputs
 	LDI	PARAM, 0xFF
 	OUT	_SFR_IO_ADDR(DDRD), PARAM
+	;unsure why all lines are disabled on port d as this should enabl all columns at once
 	COM	PARAM
 	OUT	_SFR_IO_ADDR(PORTD), PARAM
+	;reset output enable to allow illuminating leds again
 	CBI	_SFR_IO_ADDR(PORTB), LED_OE_N	; /Scan
 	RJMP	Lframe_loop
 	RET
@@ -195,7 +227,8 @@ lloop:
 	POP	r19
 	RET
  .endfunc
-
+;unsure what this function is for exactly, but it is already decently
+;documented and is not called anywhere as far as I can tell
 .func write_data
 ; r20-23 DATA
 ; r24 TYPE
@@ -236,6 +269,7 @@ write_data:
 	RET
 .endfunc
 
+;this one is also not called and doesn't even have a prototype in the C code
 .func read_data
 ; r22-25 RETURN
 ; r24 TYPE
@@ -295,14 +329,22 @@ TWI_vect:
 	PUSH	YL
 	PUSH	YH
 	PUSH	I2C_OFF
+	;save state of status register
 	IN	PWM, _SFR_IO_ADDR(SREG)
+	;load i2c status register
 	LDS	PARAM, TWSR
+	;mask out prescaler bits (could use TW_STATUS_MASK instead of literal 0xF8 to be more explicit)
 	ANDI	PARAM, 0xF8
+	;load current i2c_reg value
 	LDS	I2C_OFF, i2c_reg
+	;if we recieved our address + read and we sent ACK, goto ltsend
 	CPI	PARAM, TW_ST_SLA_ACK		; Slave Receive ACK Address
 	BREQ	ltsend
+	;
 	CPI	PARAM, TW_SR_DATA_ACK		; Slave Receive Data
 	BREQ	lreceive
+	;if we recieved our address + write and we sent ACK, goto lrack
+	;this indicates the start of an SMB transaction. The byte we recieve is the address
 	CPI	PARAM, TW_SR_SLA_ACK		; Slave Receive ACK Address
 	BREQ	lrack
 	CPI	PARAM, TW_ST_DATA_ACK		; Slave Transmit Data
